@@ -1,0 +1,53 @@
+name: Discord Daily Summary
+
+on:
+  # Run daily at 9 PM KST (8 AM UTC)
+  schedule:
+    - cron: '0 8 * * *'
+
+  # Allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  daily-summary:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[discord]"
+
+      - name: Fetch messages from Discord
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        run: |
+          python -m src.app.cli fetch-discord \
+            --guild "${{ secrets.DISCORD_GUILD_ID }}" \
+            --channels "${{ secrets.DISCORD_CHANNEL_IDS }}" \
+            --output discord_export.jsonl
+
+      - name: Ingest messages
+        run: |
+          python -m src.app.cli ingest --db data/app.db --fixture discord_export.jsonl
+
+      - name: Generate summaries and post to Discord
+        env:
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        run: |
+          python -m src.app.cli run --db data/app.db --last-hours 24 --post-to-discord
+
+      - name: Upload database (optional - for debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: database
+          path: data/app.db
+          retention-days: 7
