@@ -2,8 +2,8 @@ name: Discord Daily Summary
 
 on:
   # Run daily at 9 PM KST (8 AM UTC)
-  schedule:
-    - cron: '0 8 * * *'
+  # schedule:
+  #   - cron: '0 8 * * *'
 
   # Allow manual trigger
   workflow_dispatch:
