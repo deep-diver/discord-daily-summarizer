@@ -32,6 +32,7 @@ from src.core.renderer import (
     print_summary_table,
 )
 from src.core.summarizer import Summarizer
+from src.core.simple_summarizer import SimpleSummarizer, render_simple_summary
 from src.core.timewindow import TimeWindow, expand_date_range
 from src.infra.db import Database
 from src.infra.fixtures import load_fixture
@@ -104,46 +105,65 @@ def setup_logging(verbosity: VerbosityLevel) -> None:
 class ProgressTracker:
     """Enhanced progress tracking with detailed information."""
 
+    # Class variable to track active progress tracker (prevent nesting)
+    _active_count = 0
+
     def __init__(self, console: Console, description: str, total: Optional[int] = None):
         self.console = console
         self.description = description
         self.total = total
         self.completed = 0
-        self.progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeRemainingColumn(),
-            console=console,
-        )
+        self.is_nested = ProgressTracker._active_count > 0
         self.task_id = None
-        self.progress.start()
+
+        if not self.is_nested:
+            self.progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeRemainingColumn(),
+                console=console,
+            )
+            self.progress.start()
+        else:
+            self.progress = None
 
     def start(self):
         """Start the progress tracking."""
-        self.task_id = self.progress.add_task(f"[bold cyan]{self.description}", total=self.total)
+        if not self.is_nested:
+            self.task_id = self.progress.add_task(f"[bold cyan]{self.description}", total=self.total)
+        else:
+            # Just print the description for nested trackers
+            self.console.print(f"[dim]  → {self.description}[/dim]")
 
     def update(self, advance: int = 1, description: Optional[str] = None):
         """Update progress."""
         self.completed += advance
-        if self.task_id is not None:
+        if not self.is_nested and self.task_id is not None:
             if description:
                 self.progress.update(self.task_id, description=f"[bold cyan]{description}")
             self.progress.update(self.task_id, advance=advance)
+        elif self.is_nested and description:
+            # For nested trackers, just print updates
+            if self.completed == advance or self.completed == self.total:
+                self.console.print(f"[dim]    ✓ {description}[/dim]")
 
     def finish(self):
         """Finish progress tracking."""
-        if self.task_id is not None:
-            self.progress.update(self.task_id, completed=self.total or self.completed)
-        self.progress.stop()
+        if not self.is_nested:
+            if self.task_id is not None:
+                self.progress.update(self.task_id, completed=self.total or self.completed)
+            self.progress.stop()
 
     def __enter__(self):
+        ProgressTracker._active_count += 1
         self.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.finish()
+        ProgressTracker._active_count -= 1
 
 
 def get_event_bus() -> EventBus:
@@ -327,6 +347,9 @@ def run(
     debug: bool = typer.Option(False, "--debug", help="Enable debug output"),
     verbose: VerbosityLevel = typer.Option(VerbosityLevel.normal, "--verbose", "-v", help="Output verbosity level"),
     retries: int = typer.Option(3, "--retries", "-r", help="Number of retry attempts for failed operations"),
+    post_to_discord: bool = typer.Option(False, "--post-to-discord", help="Post summary back to Discord channels"),
+    discord_token: Optional[str] = typer.Option(None, "--discord-token", help="Discord bot token (or use DISCORD_BOT_TOKEN env var)", envvar="DISCORD_BOT_TOKEN"),
+    simple: bool = typer.Option(False, "--simple", "-s", help="Use simple 3-sentence summary format"),
 ) -> None:
     """Run the full summarization pipeline with enhanced error recovery and progress tracking.
 
@@ -472,9 +495,6 @@ def run(
 
                             total_messages_processed += len(messages)
 
-                            # Generate state with retry logic
-                            summarizer = Summarizer(glm_client, event_bus)
-
                             # Convert messages to dicts
                             message_dicts = [
                                 {
@@ -487,53 +507,98 @@ def run(
                                 for msg in messages
                             ]
 
-                            # Generate state with retries
-                            state = None
-                            for attempt in range(retries):
-                                try:
-                                    state = summarizer.generate_state(channel_name, date_str, message_dicts)
-                                    break
-                                except Exception as e:
-                                    if attempt == retries - 1:
-                                        console.print(f"[red]Failed to generate state for #{channel_name} after {retries} attempts: {e}[/red]")
-                                        total_errors += 1
+                            # Choose summarizer based on --simple flag
+                            if simple:
+                                # Simple 3-sentence summary
+                                simple_summarizer = SimpleSummarizer(glm_client, event_bus)
+
+                                simple_summary = None
+                                for attempt in range(retries):
+                                    try:
+                                        simple_summary = simple_summarizer.generate_summary(channel_name, date_str, message_dicts)
                                         break
-                                    console.print(f"[yellow]Attempt {attempt + 1}/{retries} failed for #{channel_name}, retrying...[/yellow]")
+                                    except Exception as e:
+                                        if attempt == retries - 1:
+                                            console.print(f"[red]Failed to generate summary for #{channel_name} after {retries} attempts: {e}[/red]")
+                                            total_errors += 1
+                                            break
+                                        console.print(f"[yellow]Attempt {attempt + 1}/{retries} failed for #{channel_name}, retrying...[/yellow]")
+                                        continue
+
+                                if simple_summary is None:
                                     continue
 
-                            if state is None:
-                                continue
+                                # Generate simple summary markdown
+                                summary_md = render_simple_summary(simple_summary)
 
-                            # Generate summary markdown
-                            summary_md = render_summary(state)
+                                # For simple mode, we don't compute deltas or detailed states
+                                delta = None
+                                delta_md = None
+                                state = None
 
-                            # Get previous day's state for delta
-                            previous_date = _get_previous_date(date_str)
-                            previous_state = db.get_state(previous_date, channel_id)
+                                # Print simple summary
+                                console.print()
+                                console.print(Panel(
+                                    summary_md,
+                                    title=f"[bold cyan]#{channel_name}[/bold cyan] - Simple Summary ({date_str})",
+                                    border_style="cyan",
+                                ))
 
-                            # Compute delta
-                            delta = compute_delta(state, previous_state)
-                            delta_md = render_delta(delta)
+                            else:
+                                # Detailed summary (original behavior)
+                                summarizer = Summarizer(glm_client, event_bus)
+
+                                # Generate state with retries
+                                state = None
+                                for attempt in range(retries):
+                                    try:
+                                        state = summarizer.generate_state(channel_name, date_str, message_dicts)
+                                        break
+                                    except Exception as e:
+                                        if attempt == retries - 1:
+                                            console.print(f"[red]Failed to generate state for #{channel_name} after {retries} attempts: {e}[/red]")
+                                            total_errors += 1
+                                            break
+                                        console.print(f"[yellow]Attempt {attempt + 1}/{retries} failed for #{channel_name}, retrying...[/yellow]")
+                                        continue
+
+                                if state is None:
+                                    continue
+
+                                # Generate summary markdown
+                                summary_md = render_summary(state)
+
+                                # Get previous day's state for delta
+                                previous_date = _get_previous_date(date_str)
+                                previous_state = db.get_state(previous_date, channel_id)
+
+                                # Compute delta
+                                delta = compute_delta(state, previous_state)
+                                delta_md = render_delta(delta)
 
                             # Store results with error handling
                             if store and not dry_run:
                                 try:
-                                    db.save_state(state, summary_md, channel_id)
-                                    db.save_delta(delta, delta_md, channel_id, previous_date or "null")
+                                    if not simple:
+                                        # Only store detailed states
+                                        db.save_state(state, summary_md, channel_id)
+                                        db.save_delta(delta, delta_md, channel_id, previous_date or "null")
                                 except Exception as e:
                                     console.print(f"[red]Error storing results for #{channel_name}: {e}[/red]")
                                     total_errors += 1
 
-                            # Collect for digest
-                            states[channel_id] = state
-                            deltas[channel_id] = delta
+                            # Collect for digest (only for detailed mode)
+                            if not simple:
+                                states[channel_id] = state
+                                deltas[channel_id] = delta
                             summaries[channel_id] = summary_md
 
-                            # Print summary and delta
-                            console.print()
-                            print_summary(state)
-                            console.print()
-                            print_delta(delta)
+                            # Print summary and delta (only for detailed mode, simple already printed)
+                            if not simple:
+                                console.print()
+                                print_summary(state)
+                                console.print()
+                                print_delta(delta)
 
                             channel_tracker.update(description=f"[green]Completed #{channel_name}[/green]")
 
@@ -548,8 +613,8 @@ def run(
                         total_channels_processed += 1
                         channel_tracker.update(advance=1)
 
-                # Generate and print digest
-                if states:
+                # Generate and print digest (only for detailed mode)
+                if not simple and states:
                     try:
                         digest = generate_digest(date_str, states, deltas, summaries)
                         digest_md = render_digest(digest)
@@ -561,15 +626,52 @@ def run(
                         if store and not dry_run:
                             db.save_digest(date_str, digest_md)
 
-                        # Print summary table
-                        console.print()
-                        print_summary_table(states, deltas)
-
                     except Exception as e:
                         console.print(f"[red]Error generating digest: {e}[/red]")
                         total_errors += 1
 
-                date_tracker.update(advance=1)
+                # Post to Discord if requested (works for both simple and detailed mode)
+                if post_to_discord and discord_token and summaries:
+                    from src.infra.discord_fetcher import post_message_sync
+                    import sqlite3
+
+                    console.print()
+                    console.print("[bold cyan]Posting summaries to Discord...[/bold cyan]")
+
+                    # Get channel_id and channel_name mappings
+                    # summaries dict uses channel_id as key, we need the channel_name
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT DISTINCT channel_id, channel_name FROM messages")
+                    channel_info = {row[0]: row[1] for row in cursor.fetchall()}  # channel_id -> channel_name
+                    conn.close()
+
+                    # Post summary for each channel
+                    for channel_id, summary_text in summaries.items():
+                        channel_name = channel_info.get(channel_id, f"unknown-{channel_id}")
+
+                        if summary_text:
+                            # Format the message for Discord
+                            emoji = "📝" if simple else "📊"
+                            discord_message = f"{emoji} **Daily Summary for #{channel_name} ({date_str})**\n\n{summary_text}"
+
+                            try:
+                                success = post_message_sync(
+                                    token=discord_token,
+                                    channel_id=channel_id,
+                                    message=discord_message
+                                )
+                                if success:
+                                    console.print(f"[green]✓[/green] Posted to #{channel_name}")
+                                else:
+                                    console.print(f"[red]✗[/red] Failed to post to #{channel_name}")
+                            except Exception as e:
+                                console.print(f"[red]✗[/red] Error posting to #{channel_name}: {e}")
+
+                # Print summary table (only for detailed mode)
+                if not simple:
+                    console.print()
+                    print_summary_table(states, deltas)
 
         # Print final summary
         console.print()
@@ -1233,6 +1335,299 @@ def _get_previous_date(date_str: str) -> str | None:
         return prev_dt.strftime("%Y-%m-%d")
     except ValueError:
         return None
+
+
+@app.command()
+def fetch_discord(
+    ctx: typer.Context,
+    token: str = typer.Option(..., "--token", "-t", help="Discord bot token", envvar="DISCORD_BOT_TOKEN"),
+    guild_id: str = typer.Option(..., "--guild", "-g", help="Discord guild (server) ID"),
+    channels: str = typer.Option(None, "--channels", "-c", help="Comma-separated channel IDs to fetch"),
+    output: str = typer.Option("discord_export.jsonl", "--output", "-o", help="Output JSONL file path"),
+    after: str = typer.Option(None, "--after", help="Fetch messages after this date (YYYY-MM-DD)"),
+    before: str = typer.Option(None, "--before", help="Fetch messages before this date (YYYY-MM-DD)"),
+    limit: int = typer.Option(None, "--limit", "-l", help="Max messages per channel (default: unlimited)"),
+    list_only: bool = typer.Option(False, "--list", help="List all channels in the guild and exit"),
+    verbosity: VerbosityLevel = typer.Option(VerbosityLevel.normal, "--verbose", "-v", help="Verbosity level"),
+) -> None:
+    """Fetch messages directly from Discord API.
+
+    This command connects to Discord using a bot token and downloads messages
+    from the specified channels. Messages are saved in JSONL format that can
+    be ingested using the 'ingest' command.
+
+    SETUP (one-time):
+    1. Go to https://discord.com/developers/applications
+    2. Create a new application
+    3. Go to the "Bot" section and create a bot
+    4. Copy the bot token
+    5. Enable "Message Content Intent" under Privileged Gateway Intents
+    6. Go to OAuth2 → URL Generator
+    7. Select scope: bot
+    8. Select permissions: Read Messages/View Channels, Read Message History
+    9. Copy the generated URL and open it in a browser to invite the bot to your server
+
+    GETTING GUILD AND CHANNEL IDs:
+    1. Enable Developer Mode in Discord (Settings → Advanced → Developer Mode)
+    2. Right-click on your server → Copy Server ID (guild_id)
+    3. Right-click on a channel → Copy Channel ID
+    4. Or use: --list to see all channels in your server
+
+    Examples:
+    • List all channels in a server:
+      fetch-discord --token YOUR_TOKEN --guild YOUR_GUILD_ID --list
+
+    • Fetch all messages from a channel:
+      fetch-discord --token YOUR_TOKEN --guild YOUR_GUILD_ID --channels 123456789
+
+    • Fetch messages from multiple channels:
+      fetch-discord --token YOUR_TOKEN --guild YOUR_GUILD_ID --channels 123,456,789
+
+    • Fetch last 7 days of messages:
+      fetch-discord --token YOUR_TOKEN --guild YOUR_GUILD_ID --channels 123 --after 2026-01-23
+
+    • Fetch with limit per channel:
+      fetch-discord --token YOUR_TOKEN --guild YOUR_GUILD_ID --channels 123 --limit 100
+
+    Then ingest and summarize:
+    • ingest --db data/app.db --fixture discord_export.jsonl --reset
+    • run --db data/app.db --date 2026-01-30
+    """
+    setup_logging(verbosity)
+
+    # Validate and parse channel IDs
+    if not list_only and not channels:
+        console.print("[red]Error:[/red] --channels is required when not using --list")
+        raise typer.Exit(code=1)
+
+    channel_ids = [c.strip() for c in channels.split(",") if c.strip()] if channels else []
+
+    try:
+        from src.infra.discord_fetcher import DiscordFetcher, list_channels_sync, fetch_messages_sync
+        from datetime import datetime
+        from rich.console import Console
+        from rich.table import Table
+
+        fetch_console = Console()
+
+        if list_only:
+            # List channels mode
+            with console.status("[bold cyan]Connecting to Discord...[/bold cyan]"):
+                channels_list = list_channels_sync(token=token, guild_id=guild_id)
+
+            # Display channels in a nice table
+            table = Table(title=f"Channels in Guild: {guild_id}")
+            table.add_column("Channel Name", style="cyan")
+            table.add_column("Channel ID", style="yellow")
+            table.add_column("Topic", style="dim")
+            table.add_column("Position", style="dim")
+
+            for ch in sorted(channels_list, key=lambda x: x["position"]):
+                topic = ch["topic"] or ""
+                if len(topic) > 40:
+                    topic = topic[:37] + "..."
+                table.add_row(f"#{ch['name']}", ch["id"], topic, str(ch["position"]))
+
+            fetch_console.print(table)
+            fetch_console.print()
+            fetch_console.print("[dim]Use the Channel IDs with --channels to fetch messages[/dim]")
+            return
+
+        # Parse date filters
+        after_dt = None
+        before_dt = None
+        if after:
+            try:
+                after_dt = datetime.strptime(after, "%Y-%m-%d")
+            except ValueError:
+                console.print(f"[red]Error:[/red] Invalid --after date format. Use YYYY-MM-DD")
+                raise typer.Exit(code=1)
+
+        if before:
+            try:
+                before_dt = datetime.strptime(before, "%Y-%m-%d")
+            except ValueError:
+                console.print(f"[red]Error:[/red] Invalid --before date format. Use YYYY-MM-DD")
+                raise typer.Exit(code=1)
+
+        # Fetch messages
+        console.print(f"[bold cyan]Fetching Discord messages...[/bold cyan]")
+        console.print(f"  [dim]Guild:[/dim] {guild_id}")
+        console.print(f"  [dim]Channels:[/dim] {', '.join(channel_ids)}")
+        if after_dt:
+            console.print(f"  [dim]After:[/dim] {after}")
+        if before_dt:
+            console.print(f"  [dim]Before:[/dim] {before}")
+        if limit:
+            console.print(f"  [dim]Limit:[/dim] {limit} per channel")
+        console.print(f"  [dim]Output:[/dim] {output}")
+        console.print()
+
+        with console.status("[bold cyan]Connecting to Discord and fetching messages...[/bold cyan]"):
+            message_count = fetch_messages_sync(
+                token=token,
+                guild_id=guild_id,
+                channel_ids=channel_ids,
+                output_path=output,
+                after=after_dt,
+                before=before_dt,
+                limit=limit,
+            )
+
+        console.print()
+        console.print(f"[green]✓[/green] Successfully fetched {message_count} messages")
+        console.print(f"[green]✓[/green] Saved to: {output}")
+        console.print()
+        console.print("[bold]Next steps:[/bold]")
+        console.print(f"  1. Ingest the data:")
+        console.print(f"     [cyan]python -m app.cli ingest --db data/app.db --fixture {output} --reset[/cyan]")
+        console.print(f"  2. Run summarization:")
+        console.print(f"     [cyan]python -m app.cli run --db data/app.db --date {after or datetime.now().strftime('%Y-%m-%d')}[/cyan]")
+
+    except ImportError:
+        console.print("[red]Error:[/red] discord.py is not installed")
+        console.print("[dim]Install it with: pip install discord.py[/dim]")
+        console.print("[dim]Or: pip install -e '.[discord]'[/dim]")
+        raise typer.Exit(code=1)
+
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        import traceback
+        console.print(traceback.format_exc())
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def simulate(
+    guild_id: str = typer.Option(..., "--guild", "-g", help="Discord guild (server) ID"),
+    channel_id: str = typer.Option(..., "--channel", "-c", help="Discord channel ID"),
+    days: int = typer.Option(3, "--days", "-d", help="Number of days to simulate"),
+    messages_per_day: int = typer.Option(20, "--messages", "-m", help="Messages per day"),
+    pattern: str = typer.Option("normal", "--pattern", "-p", help="Activity pattern: normal, bursty, quiet"),
+    output: str = typer.Option("simulated_messages.jsonl", "--output", "-o", help="Output JSONL file"),
+    post_to_discord: bool = typer.Option(False, "--post", help="Post messages to Discord (requires token)"),
+    discord_token: str = typer.Option(None, "--token", "-t", help="Discord bot token (required if using --post)", envvar="DISCORD_BOT_TOKEN"),
+    verbosity: VerbosityLevel = typer.Option(VerbosityLevel.normal, "--verbose", "-v", help="Verbosity level"),
+) -> None:
+    """Simulate realistic Discord community activity.
+
+    Generates realistic messages with different personas (tech lead, helper, casual,
+    gamer, newbie, enthusiast) to test the summarizer. Can save to JSONL for
+    local testing or post directly to Discord.
+
+    PERSONAS:
+    • tech_lead: Technical discussions, code reviews, deployment updates
+    • helper: Questions, guidance, documentation links
+    • casual: Random chat, memes, life updates
+    • gamer: Gaming discussions, streaming, squad ups
+    • newbie: Learning questions, confusion, gratitude
+    • enthusiast: Ideas, suggestions, community excitement
+
+    PATTERNS:
+    • normal: Evenly distributed messages throughout the day
+    • bursty: Bursts of activity separated by quiet periods
+    • quiet: Few messages, mostly in evening hours
+
+    Examples:
+    • Simulate 3 days of normal activity (JSONL only):
+      simulate --guild 123 --channel 456 --days 3
+
+    • Simulate 5 days with 30 messages per day:
+      simulate --guild 123 --channel 456 --days 5 --messages 30
+
+    • Simulate bursty activity pattern:
+      simulate --guild 123 --channel 456 --days 3 --pattern bursty
+
+    • Simulate and post to real Discord:
+      simulate --guild 123 --channel 456 --days 1 --post --token YOUR_TOKEN
+
+    Then run summarization:
+    • ingest --db data/app.db --fixture simulated_messages.jsonl --reset
+    • run --db data/app.db --start 2026-01-27 --end 2026-01-30 --post-to-discord
+    """
+    setup_logging(verbosity)
+
+    try:
+        from src.infra.discord_simulator import (
+            DiscordSimulator,
+            simulate_community_activity,
+            post_messages_sync,
+        )
+        from datetime import datetime, timedelta
+
+        console.print(f"[bold cyan]Simulating Community Activity[/bold cyan]")
+        console.print()
+        console.print(f"  [dim]Guild:[/dim] {guild_id}")
+        console.print(f"  [dim]Channel:[/dim] {channel_id}")
+        console.print(f"  [dim]Days:[/dim] {days}")
+        console.print(f"  [dim]Messages per day:[/dim] {messages_per_day}")
+        console.print(f"  [dim]Pattern:[/dim] {pattern}")
+        console.print(f"  [dim]Output:[/dim] {output}")
+        console.print()
+
+        # Calculate start date (days ago from now)
+        start_date = datetime.now() - timedelta(days=days)
+
+        if pattern not in ["normal", "bursty", "quiet"]:
+            console.print(f"[red]Error:[/red] Pattern must be 'normal', 'bursty', or 'quiet'")
+            raise typer.Exit(code=1)
+
+        # Generate simulated messages
+        messages = simulate_community_activity(
+            guild_id=guild_id,
+            channel_id=channel_id,
+            start_date=start_date,
+            num_days=days,
+            messages_per_day=messages_per_day,
+            activity_pattern=pattern,
+            output_file=output,
+        )
+
+        console.print()
+        console.print(f"[green]✓[/green] Generated {len(messages)} messages")
+
+        if post_to_discord:
+            if not discord_token:
+                console.print("[red]Error:[/red] --token is required when using --post")
+                raise typer.Exit(code=1)
+
+            console.print()
+            console.print(f"[bold cyan]Posting to Discord...[/bold cyan]")
+
+            posted = post_messages_sync(
+                messages=messages,
+                token=discord_token,
+                channel_id=channel_id,
+                delay_range=(0.5, 2),  # Faster for simulation
+            )
+
+            console.print(f"[green]✓[/green] Posted {posted} messages to Discord")
+            console.print()
+            console.print("[bold]Next steps:[/bold]")
+            console.print(f"  Wait a minute for messages to propagate, then:")
+            console.print(f"  [cyan]python -m app.cli run --db data/app.db --last-hours {days * 24} --post-to-discord[/cyan]")
+
+        else:
+            console.print()
+            console.print("[bold]Next steps:[/bold]")
+            console.print(f"  1. Ingest the simulated data:")
+            console.print(f"     [cyan]python -m app.cli ingest --db data/app.db --fixture {output} --reset[/cyan]")
+            console.print(f"  2. Run summarization:")
+            console.print(f"     [cyan]python -m app.cli run --db data/app.db --last-hours {days * 24}[/cyan]")
+            console.print(f"  Or with posting to Discord:")
+            console.print(f"     [cyan]python -m app.cli run --db data/app.db --last-hours {days * 24} --post-to-discord[/cyan]")
+
+    except ImportError:
+        console.print("[red]Error:[/red] discord.py is not installed")
+        console.print("[dim]Install it with: pip install discord.py[/dim]")
+        console.print("[dim]Or: pip install -e '.[discord]'[/dim]")
+        raise typer.Exit(code=1)
+
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        import traceback
+        console.print(traceback.format_exc())
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
