@@ -1,0 +1,1 @@
+"""Application CLI module."""
