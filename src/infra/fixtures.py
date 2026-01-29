@@ -190,8 +190,15 @@ def load_fixture(fixture_path: str | Path, default_channel_name: str = "general"
 
                 if detected_format == "discord":
                     # Discord format - need to handle channel name per message
-                    # Discord messages don't include channel_name, so we extract from context
-                    message = _load_discord_format(data, discord_channel_name, line_num)
+                    # Check if _channel_name was added by our fetcher
+                    if "_channel_name" in data:
+                        channel_name_for_message = data["_channel_name"]
+                        # Remove the temporary field
+                        del data["_channel_name"]
+                    else:
+                        channel_name_for_message = discord_channel_name
+
+                    message = _load_discord_format(data, channel_name_for_message, line_num)
                 else:
                     # Standard format
                     message = _load_standard_format(data, line_num)
