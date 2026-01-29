@@ -54,3 +54,6 @@ credentials.enc
 # OS
 .DS_Store
 Thumbs.db
+
+# Temporary exports
+*.jsonl
